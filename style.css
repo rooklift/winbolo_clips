@@ -1,0 +1,459 @@
+/* The WinBolo Replay Viewer's stylesheet (layout and palette after the
+ * Ancient Bolo Log Viewer, itself after the lgm map editor's dark theme),
+ * with the clip maker's panel, seek bar span and dialogs added. */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #layout { height: 100%; }
+
+/* Tell the engine the page is dark, so the parts of a form control the
+ * page can't paint (the select's dropdown list, scrollbars) come out dark
+ * too. */
+html { color-scheme: dark; }
+
+body {
+	background: #10131a;
+	color: #cfd6e4;
+	font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+	overflow: hidden;
+	user-select: none;
+}
+
+#layout { display: flex; }
+
+#main {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	position: relative;
+}
+
+#view {
+	flex: 1;
+	width: 100%;
+	min-height: 0;
+	cursor: grab;
+	display: block;
+	background: #0a0e16;
+}
+
+#coordinateDebug {
+	position: absolute;
+	top: 10px;
+	left: 10px;
+	padding: 5px 8px;
+	background: rgba(10, 14, 22, 0.88);
+	border: 1px solid #53617b;
+	border-radius: 4px;
+	box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+	color: #cfd6e4;
+	font: 12px/1.4 ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
+	font-variant-numeric: tabular-nums;
+	pointer-events: none;
+	z-index: 1;
+}
+
+#coordinateDebug span {
+	display: inline-block;
+	min-width: 9ch;
+	text-align: right;
+}
+
+#dropHint {
+	position: absolute;
+	inset: 0 0 40px 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	text-align: center;
+	color: #8b96ad;
+	cursor: pointer; /* the whole hint is the open button */
+}
+#dropHint h1 { font-size: 20px; margin-bottom: 8px; color: #cfd6e4; }
+#dropHintLink { margin-top: 8px; }
+/* Set well below the rest: it's the afterthought, not part of how to open a replay. */
+#dropHintKeys { margin-top: 56px; }
+#dropHintKeys:hover { color: #cfd6e4; }		/* its own click target, not part of the open button */
+#dropHintLink a { color: #5b8def; }
+#dropHint.hidden { display: none; }
+
+#transport {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 6px 10px;
+	background: #161b26;
+	border-top: 1px solid #262d3d;
+}
+#transport button {
+	background: #232b3d;
+	border: 1px solid #33405c;
+	color: #cfd6e4;
+	border-radius: 4px;
+	width: 34px;
+	height: 26px;
+	font-size: 13px;
+	cursor: pointer;
+}
+#transport button:hover { background: #2c3650; }
+/* The sound button draws one of two icons: the waves while sound is on,
+ * the cross while it is muted. */
+#soundBtn { display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+#soundBtn[aria-pressed="true"] .sound-muted,
+#soundBtn[aria-pressed="false"] .sound-waves { display: none; }
+#transport select {
+	background-color: #232b3d;
+	border: 1px solid #33405c;
+	color: #cfd6e4;
+	border-radius: 4px;
+	height: 26px;
+}
+/* Player lock active: the player selector takes the viewer's friendly
+ * green, in shades matched to the dark controls. (background-color, not
+ * the shorthand: the shorthand would wipe the chevron below.) */
+#viewpoint.locked {
+	background-color: #1e3d27;
+	border-color: #418a54;
+	color: #b5efc2;
+}
+
+/* Chromium and WebView2 drop a select to a plain styleable box as soon
+ * as its border is set, but Safari keeps drawing the platform's popup
+ * button and ignores the colours above, leaving a white menu in the dark
+ * bar. Turn the native look off everywhere so every engine paints the
+ * same box, and draw the chevron ourselves: two half-transparent
+ * gradients meeting in a V, since the CSP's default-src 'self' blocks a
+ * data: image and img-src is not opened just for this. */
+#transport select, #clipPanel select {
+	appearance: none;
+	-webkit-appearance: none;
+	font: inherit;
+	padding: 0 22px 0 8px;
+	background-image:
+		linear-gradient(45deg, transparent 50%, currentColor 50%),
+		linear-gradient(135deg, currentColor 50%, transparent 50%);
+	background-position: calc(100% - 13px) calc(50% - 1px), calc(100% - 8px) calc(50% - 1px);
+	background-size: 5px 5px, 5px 5px;
+	background-repeat: no-repeat;
+}
+/* The seek slider, drawn by hand so every engine matches Firefox's look:
+ * a thin rounded track, light on the unplayed side and accent-blue on the
+ * played side, under a grey thumb with a white ring. Firefox paints the
+ * played side itself (::-moz-range-progress); WebKit/Blink have no such
+ * part, so renderer.js keeps --seek_fill (0 to 1) in step with the value
+ * and the track's gradient splits there. The split sits at the thumb's
+ * centre, which travels from 8px to (100% - 8px), not from 0 to 100%. */
+#seekWrap {
+	flex: 1;
+	min-width: 0;
+	position: relative;
+	display: flex;
+	align-items: center;
+	--clip_a: 0;
+	--clip_b: 0;
+}
+/* The clip's span of the game, under the track: an amber bar from its
+ * start to its end, or a tick where only one of them is set. Positioned
+ * like the track's fill, between the thumb's two extreme centres. */
+#clipSpan {
+	display: none;
+	position: absolute;
+	top: 100%;
+	margin-top: -3px;
+	height: 3px;
+	min-width: 2px;
+	left: calc(8px + var(--clip_a) * (100% - 16px));
+	width: calc((var(--clip_b) - var(--clip_a)) * (100% - 16px));
+	background: #f0b429;
+	border-radius: 1px;
+	pointer-events: none;
+}
+#seekWrap.has-clip #clipSpan { display: block; }
+#seek {
+	width: 100%;
+	--seek_fill: 0;
+	appearance: none;
+	-webkit-appearance: none;
+	height: 16px;
+	background: transparent;
+}
+#seek::-webkit-slider-runnable-track {
+	height: 4px;
+	border-radius: 2px;
+	background: linear-gradient(to right,
+		#5b8def calc(8px + var(--seek_fill) * (100% - 16px)),
+		#e5e5e5 calc(8px + var(--seek_fill) * (100% - 16px)));
+}
+#seek::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	width: 16px;
+	height: 16px;
+	margin-top: -6px;
+	border: 2px solid #fff;
+	border-radius: 50%;
+	background: #666;
+}
+#seek::-moz-range-track {
+	height: 4px;
+	border-radius: 2px;
+	background: #e5e5e5;
+}
+#seek::-moz-range-progress {
+	height: 4px;
+	border-radius: 2px;
+	background: #5b8def;
+}
+#seek::-moz-range-thumb {
+	box-sizing: border-box;
+	width: 16px;
+	height: 16px;
+	border: 2px solid #fff;
+	border-radius: 50%;
+	background: #666;
+}
+
+/* Transport controls are mouse-driven (all keys are global), so never show
+ * a focus highlight on them. */
+#transport button:focus, #transport select:focus, #seek:focus { outline: none; }
+#timeLabel { font-variant-numeric: tabular-nums; white-space: nowrap; }
+#zoomLabel { color: #8b96ad; white-space: nowrap; }
+
+#sidebar {
+	width: 322px;
+	background: #141925;
+	border-left: 1px solid #262d3d;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.panel {
+	padding: 10px 12px;
+	border-bottom: 1px solid #232939;
+}
+.panel h2 {
+	font-size: 12px;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #8b96ad;
+	margin-bottom: 6px;
+}
+/* Integral line height, so consecutive lines sit an even number of
+ * pixels apart on a 1x display. */
+.hint { color: #8b96ad; font-size: 12px; line-height: 17px; }
+.hint .has-tip { cursor: help; }
+
+#players .player {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 2px 0;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+#players .chip {
+	width: 10px;
+	height: 10px;
+	border-radius: 2px;
+	flex: none;
+	border: 1px solid rgba(255, 255, 255, 0.35);
+}
+#players .player.gone { color: #667; text-decoration: line-through; }
+#players .host { color: #8b96ad; font-size: 11px; }
+
+#chatPanel {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	border-bottom: none;
+}
+#chat {
+	flex: 1;
+	overflow-y: auto;
+	font-size: 14px;
+	line-height: 20px; /* whole pixels: the body's 1.45 would give 20.3px, and the lines would snap unevenly */
+	min-height: 0;
+}
+/* Slim dark scrollbar to match the panel */
+#chat { scrollbar-width: thin; scrollbar-color: #2c3650 transparent; }
+#chat::-webkit-scrollbar { width: 8px; }
+#chat::-webkit-scrollbar-track { background: transparent; }
+#chat::-webkit-scrollbar-thumb {
+	background: #2c3650;
+	border-radius: 4px;
+}
+#chat::-webkit-scrollbar-thumb:hover { background: #3a4763; }
+
+#chat .msg { padding: 1px 0; word-wrap: break-word; }
+#chat .msg .t { color: #667a99; font-variant-numeric: tabular-nums; }
+#chat .msg .who { font-weight: 600; }
+#chat .msg.sys { color: #8b96ad; font-style: italic; }
+
+/* The clip panel: rows of a label, a value and the buttons that act on
+ * it. Its controls are dressed as the transport's are. */
+.clipRow {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 26px;
+	margin-bottom: 4px;
+}
+.clipKey { width: 46px; flex: none; color: #8b96ad; }
+.clipValue {
+	flex: 1;
+	min-width: 0;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	font-variant-numeric: tabular-nums;
+}
+.clipRow label { display: flex; align-items: center; gap: 6px; }
+.clipRow input[type="checkbox"] { accent-color: #5b8def; }
+.clipRow label:has(input:disabled) { opacity: 0.45; }
+.clipActions { margin-top: 8px; }
+.clipActions button { flex: 1; }
+#clipProblem:empty { display: none; }
+#clipPanel button, #clipPanel select, .modalButtons button, .modalButtons a {
+	background-color: #232b3d;
+	border: 1px solid #33405c;
+	color: #cfd6e4;
+	border-radius: 4px;
+	height: 26px;
+	padding: 0 10px;
+	font: inherit;
+	cursor: pointer;
+}
+#clipPanel select { padding: 0 22px 0 8px; } /* room for the chevron */
+#clipPanel button:hover:enabled, .modalButtons button:hover, .modalButtons a:hover { background-color: #2c3650; }
+#clipPanel button:disabled, #clipPanel select:disabled { opacity: 0.45; cursor: default; }
+#clipPanel button.primary, .modalButtons .primary { background-color: #2c4a7c; border-color: #5b8def; }
+#clipPanel button.primary:hover:enabled, .modalButtons .primary:hover { background-color: #365a94; }
+#clipPanel button:focus, #clipPanel select:focus { outline: none; }
+
+/* Dialogs: the shortcut sheet, the export's progress and its result, each
+ * a box centred on a scrim over the whole page. */
+.modal {
+	position: fixed;
+	inset: 0;
+	z-index: 10;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 16px;
+	background: rgba(10, 14, 22, 0.7);
+}
+.modal.hidden { display: none; }
+.modalBox {
+	background: #161b26;
+	border: 1px solid #33405c;
+	border-radius: 6px;
+	padding: 18px 20px;
+	box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+.modalBox h1 { font-size: 15px; margin-bottom: 12px; }
+.modalButtons {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 14px;
+}
+.modalButtons a {
+	display: inline-flex;
+	align-items: center;
+	text-decoration: none;
+}
+.modalButtons button:focus, .modalButtons a:focus { outline: none; }
+.modalButtons button:focus-visible, .modalButtons a:focus-visible {
+	outline: 1px solid #5b8def;
+	outline-offset: 1px;
+}
+
+#exportBox { width: 420px; max-width: 100%; }
+#exportBar {
+	height: 10px;
+	background: #232b3d;
+	border-radius: 5px;
+	overflow: hidden;
+	margin-bottom: 8px;
+}
+#exportBarFill {
+	height: 100%;
+	width: 0;
+	background: #5b8def;
+}
+
+/* The finished clip, shown at its own size where the window has room for
+ * it and scaled down to fit where it has not; never scaled up, and never
+ * smoothed, so it looks here as it will in a player at 1:1. */
+#clipResultBox {
+	display: flex;
+	flex-direction: column;
+	max-width: 100%;
+	max-height: 100%;
+	min-width: 340px;
+}
+#clipResultVideo {
+	display: block;
+	align-self: center;
+	max-width: 100%;
+	min-height: 0;
+	flex: 0 1 auto;
+	background: #0a0e16;
+	image-rendering: pixelated;
+}
+#clipResultInfo { margin-top: 10px; font-variant-numeric: tabular-nums; }
+
+/* Shortcut sheet: there is no menu to write the keys in, so they are
+ * written here. After the Ancient Bolo Log Viewer's, laid out in two
+ * flowing columns so a tall group doesn't leave a hole beside a short
+ * one. */
+#shortcutBox {
+	width: min(620px, 100%);
+	max-height: 100%;
+	overflow: auto;
+	background: #161b26;
+	border: 1px solid #33405c;
+	border-radius: 6px;
+	padding: 15px 17px 5px;		/* the last group's own margin makes up the rest */
+	box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+#shortcutGroups { column-count: 2; column-gap: 22px; }
+.shortcutGroup { break-inside: avoid; margin-bottom: 10px; }
+.shortcutGroup h2 {
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #8b96ad;
+	margin-bottom: 4px;
+	padding-bottom: 3px;
+	border-bottom: 1px solid #262d3d;
+}
+.shortcutRow {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	padding: 2px 0;
+}
+.shortcutRow .what { flex: 1; min-width: 0; }
+.shortcutRow .keys { display: flex; align-items: baseline; gap: 3px; flex: none; }
+.shortcutRow .sep { color: #6f7a91; }
+.shortcutRow .via { color: #8b96ad; font-size: 12px; flex: none; }
+#shortcutSheet kbd, #dropHint kbd {
+	display: inline-block;
+	background: #232b3d;
+	border: 1px solid #33405c;
+	border-bottom-width: 2px;
+	border-radius: 3px;
+	padding: 1px 5px;
+	min-width: 21px;
+	text-align: center;
+	font: 12px/1.5 ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
+	color: #cfd6e4;
+	white-space: nowrap;
+}
+/* A narrow browser window can't hold two columns of key caps. */
+@media (max-width: 620px) {
+	#shortcutGroups { column-count: 1; }
+}

@@ -1,0 +1,14 @@
+{
+	"name": "winbolo_clips",
+	"version": "0.1.0",
+	"description": "WinBolo Clips: cuts video clips out of WinBolo replays (.wbv)",
+	"main": "main.js",
+	"scripts": {
+		"start": "electron .",
+		"sync": "node tools/sync.js",
+		"test": "node test/test-engine.js && node test/test-webm.js && node test/test-mixer.js"
+	},
+	"engines": {
+		"node": ">=18"
+	}
+}

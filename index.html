@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<!-- 'unsafe-inline' for styles: the renderer colours player chips and chat
+	     names with style attributes in generated HTML. blob: media is the
+	     game's sounds (built from engine/sound_data.js) and the finished clip. -->
+	<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'">
+	<title>WinBolo Clips</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<div id="layout">
+		<div id="main">
+			<canvas id="view"></canvas>
+			<div id="coordinateDebug" hidden>
+				<div>tile <span id="coordinateTile"></span></div>
+				<div>pixel <span id="coordinatePixel"></span></div>
+			</div>
+			<div id="dropHint">
+				<div>
+					<h1>WinBolo Clips</h1>
+					<p>Open a WinBolo replay (.wbv) to cut a video clip from: drop it here, click to choose one, or press Ctrl+O.</p>
+					<p id="dropHintLink">For more information, see <a href="https://github.com/rooklift/winbolo_clips" target="_blank" rel="noopener">github.com/rooklift/winbolo_clips</a></p>
+					<p id="dropHintKeys">Press <kbd>?</kbd> for keyboard shortcuts.</p>
+				</div>
+			</div>
+			<div id="transport">
+				<button id="playBtn" title="Play / pause (space)">▶</button>
+				<span id="timeLabel">0:00.00 / 0:00</span>
+				<div id="seekWrap">
+					<input id="seek" type="range" min="0" max="1000" value="0" step="1">
+					<div id="clipSpan"></div>
+				</div>
+				<select id="speed" title="Playback speed">
+					<option value="0.5">0.5×</option>
+					<option value="1" selected>1×</option>
+					<option value="1.5">1.5×</option>
+					<option value="2">2×</option>
+					<option value="3">3×</option>
+					<option value="4">4×</option>
+					<option value="6">6×</option>
+					<option value="8">8×</option>
+					<option value="12">12×</option>
+					<option value="16">16×</option>
+					<option value="24">24×</option>
+					<option value="32">32×</option>
+					<option value="48">48×</option>
+					<option value="64">64×</option>
+				</select>
+				<button id="soundBtn" title="Enable game sounds (automatically muted above 1× speed)" aria-label="Game sounds" aria-pressed="false">
+					<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M11 4 6 8H3v8h3l5 4Z"/>
+						<path class="sound-waves" d="M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/>
+						<path class="sound-muted" d="m16 9 6 6m0-6-6 6"/>
+					</svg>
+				</button>
+				<select id="viewpoint" title="Player used for friendly colours and player lock"></select>
+				<span id="zoomLabel"></span>
+				<button id="helpBtn" title="Keyboard and mouse shortcuts (?)" aria-expanded="false">?</button>
+			</div>
+		</div>
+		<div id="sidebar">
+			<div class="panel" id="gamePanel">
+				<h2 id="mapName">No replay loaded</h2>
+				<div id="gameMeta" class="hint"></div>
+				<div id="versionMeta" class="hint"></div>
+				<div id="gameTypeMeta" class="hint"></div>
+				<div class="hint"><span id="modsMeta"></span><span id="lagSep" hidden> · </span><span id="lagMeta"></span></div>
+			</div>
+			<div class="panel" id="clipPanel">
+				<h2>Clip</h2>
+				<div class="clipRow">
+					<span class="clipKey">Region</span>
+					<span class="clipValue" id="clipRegion">whole view</span>
+				</div>
+				<div class="clipRow">
+					<span class="clipKey"></span>
+					<select id="clipAspect" title="Shape of the region">
+						<option value="free">Free shape</option>
+						<option value="16:9">16:9</option>
+						<option value="4:3">4:3</option>
+						<option value="1:1">1:1</option>
+						<option value="9:16">9:16</option>
+					</select>
+					<button id="clipFit" title="Make the region the view as it stands">Fit to view</button>
+					<button id="clipClear" title="Unmark the region: the clip is the whole view" disabled>Clear</button>
+				</div>
+				<div class="clipRow">
+					<span class="clipKey">Start</span>
+					<span class="clipValue" id="clipStart">not set</span>
+					<button id="clipSetStart" title="Start the clip at the current time ([)">Set</button>
+					<button id="clipGoStart" title="Go to the clip's start (Shift+[)" disabled>Go</button>
+				</div>
+				<div class="clipRow">
+					<span class="clipKey">End</span>
+					<span class="clipValue" id="clipEnd">not set</span>
+					<button id="clipSetEnd" title="End the clip at the current time (])">Set</button>
+					<button id="clipGoEnd" title="Go to the clip's end (Shift+])" disabled>Go</button>
+				</div>
+				<div class="clipRow">
+					<span class="clipKey">Length</span>
+					<span class="clipValue" id="clipLength">–</span>
+				</div>
+				<div class="clipRow">
+					<span class="clipKey">Video</span>
+					<select id="clipSpeed" title="Speed of the game in the clip">
+						<option value="0.25">0.25×</option>
+						<option value="0.5">0.5×</option>
+						<option value="1" selected>1×</option>
+						<option value="2">2×</option>
+						<option value="4">4×</option>
+						<option value="8">8×</option>
+					</select>
+					<select id="clipFps" title="Frames per second. The game runs at 50 ticks a second: 50 shows every one of them.">
+						<option value="25">25 fps</option>
+						<option value="50" selected>50 fps</option>
+					</select>
+					<select id="clipQuality" title="Picture quality: higher is a larger file">
+						<option value="standard">Standard</option>
+						<option value="high" selected>High</option>
+						<option value="max">Maximum</option>
+					</select>
+				</div>
+				<div class="clipRow">
+					<span class="clipKey"></span>
+					<label><input type="checkbox" id="clipSound" checked> Game sounds</label>
+					<span class="hint" id="clipSoundNote"></span>
+				</div>
+				<div class="clipRow clipActions">
+					<button id="clipPlay" title="Play the clip's span of the game once (Enter)" disabled>Play clip</button>
+					<button id="clipExport" class="primary" title="Render the clip to a WebM video" disabled>Export clip</button>
+				</div>
+				<div class="hint" id="clipProblem"></div>
+			</div>
+			<div class="panel">
+				<h2>Players</h2>
+				<div id="players"></div>
+			</div>
+			<div class="panel" id="chatPanel">
+				<h2>Message wire</h2>
+				<div id="chat"></div>
+			</div>
+		</div>
+	</div>
+	<div id="shortcutSheet" class="modal hidden">
+		<div id="shortcutBox" role="dialog" aria-label="Keyboard and mouse shortcuts">
+			<div id="shortcutGroups"></div>
+		</div>
+	</div>
+	<div id="exportOverlay" class="modal hidden">
+		<div class="modalBox" id="exportBox" role="dialog" aria-label="Exporting clip">
+			<h1>Exporting clip</h1>
+			<div id="exportBar"><div id="exportBarFill"></div></div>
+			<div id="exportLabel" class="hint"></div>
+			<div class="modalButtons">
+				<button id="exportCancel">Cancel</button>
+			</div>
+		</div>
+	</div>
+	<div id="clipResult" class="modal hidden">
+		<div class="modalBox" id="clipResultBox" role="dialog" aria-label="The exported clip">
+			<video id="clipResultVideo" controls loop playsinline></video>
+			<div id="clipResultInfo" class="hint"></div>
+			<div class="modalButtons">
+				<button id="clipResultClose">Close</button>
+				<a id="clipResultSave" class="primary" role="button">Save clip</a>
+			</div>
+		</div>
+	</div>
+	<input type="file" id="filePick" accept=".wbv,.dat,application/zip" hidden>
+	<script src="engine/format.js"></script>
+	<script src="engine/sprite_data.js"></script>
+	<script src="engine/sprites.js"></script>
+	<script src="engine/logparse.js"></script>
+	<script src="engine/sound_data.js"></script>
+	<script src="engine/sound.js"></script>
+	<script src="engine/game.js"></script>
+	<script src="mixer.js"></script>
+	<script src="webm.js"></script>
+	<script src="renderer.js"></script>
+	<script src="clip.js"></script>
+	<script src="video.js"></script>
+</body>
+</html>

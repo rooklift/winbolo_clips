@@ -1,0 +1,1151 @@
+/* Replay engine: turns a parsed WinBolo log into world state at any tick.
+ * The server's periodic snapshots are the keyframes; the events between
+ * them replay forward. No DOM use, so node tests can load it too. */
+"use strict";
+(function () {
+
+const WinBoloLog = typeof module !== "undefined" && module.exports
+	? require("../src/parse.js") : window.WinBoloLog;
+
+const WinBoloSound = typeof module !== "undefined" && module.exports
+	? require("./sound.js") : window.WinBoloSound;
+
+const { MAP_SIZE, DEEP_SEA, NEUTRAL, MAX_TANKS, TICKS_PER_SECOND } = WinBoloLog;
+const EV = WinBoloLog.EVENT;
+
+/* Transient effects (from the sound events) stay on screen this long. */
+const EFFECT_TICKS = 30;
+
+/* ---------- shell tracking ----------
+ * The log names no shell: each tick lists every shell in flight (square,
+ * pixel, 16-way direction) and every explosion (square, pixel, animation
+ * stage) as the server holds them. But the server's view is exact and
+ * restated every tick, so the lists link up: a shell moves its speed
+ * along its heading each tick (32 world units, an eighth of a tile, unless
+ * a WinBolo 2.1 scenario changed the shell_speed rule; a shell keeps the
+ * speed it was fired at), it starts a little ahead of the tank or pillbox
+ * that fired it, and when it dies its flight position stops and a fresh
+ * burst appears one tick later, a step along its heading. From that the tracker gives each shell
+ * an owner and each burst a cause: terrain (a MapChange at the spot that
+ * tick), a pillbox (PillSetHealth on the pillbox there), a tank (one
+ * within a tile), or a fall, the shell landing at the end of its range
+ * with nothing in its way. Falls draw as the gentle splash of the Ancient
+ * Bolo viewer instead of the fireball the log animates. */
+const SHELL_STEP = 32 / 256;             /* tiles per tick */
+const TRACK_TOLERANCE = 0.2;             /* tiles: a shell's next position against its predicted one */
+/* A burst against the track it ends. A fall bursts at the shell's own
+ * position; a pillbox or terrain hit snaps the burst to the centre of the
+ * square hit (shellsCalcCollision), up to 0.7 tiles from the shell, and a
+ * tank hit bursts where the shell struck. So a burst may sit anywhere
+ * from a little behind the last position to a few steps ahead, within
+ * a square's reach across the heading. */
+const BURST_AHEAD = 1.0;                 /* tiles ahead of the last position, at most */
+const BURST_BEHIND = 0.4;                /* tiles behind it, at most (the snap can pull it back) */
+const BURST_ACROSS = 0.8;                /* tiles off the heading, at most */
+const MUZZLE_TOLERANCE = 1.0;            /* tiles: a new shell against the tank or pill that fired it (its first logged position is already most of a tile out) */
+const TANK_HIT_BOX = 0.5 + 1 / 32;       /* tiles: tankIsTankHit takes a shell within 128 world units (half a tile) of the centre on both axes; the 1/32 is pixel rounding */
+const LAG_HIT_RANGE = 2;                 /* tiles: a tank hurt this tick this near a burst was hit on the shooter's screen, where it was up to 14 ticks before (lag compensation) */
+const BURST_FRAME_TICKS = 28;            /* a burst animates for 23 ticks (stage 8 for two, the rest for three each), with slack */
+const TRACK_GRACE_TICKS = 3;             /* a burst follows its last flight position after at most this many ticks */
+const DIRECTION_ERROR = 2 * Math.sin(Math.PI / 32); /* the log's 16 directions round a 256-way heading: off by up to this per tile travelled */
+/* The rules a shell flies by (WinBolo 2.1's shell_speed, in world units a
+ * tick, and shell_start_add, the steps it starts ahead of its muzzle), with
+ * the classic values; scripts.json gives a round's own and RuleSet events
+ * change them. Out of sim_rules.c's range, a value is ignored. */
+const CLASSIC_SHELL_RULES = { shell_speed: 32, shell_start_add: 5 };
+const DIR_VECTORS = Array.from({ length: 16 }, (_, d) => {
+	let a = d / 16 * 2 * Math.PI; /* 0 north, clockwise */
+	return [Math.sin(a), -Math.cos(a)];
+});
+const PILL_OWNER = "pill";
+const CRATER = 3, MINE_START = 10;
+const MINE_KILL_TICKS = 30;              /* a mine blast this recent under a dying tank is what killed it (a chain takes ~10 ticks a square) */
+const SINK_TICKS = 4;                    /* a hit and the boat flag dropping this recently before a drowning: the boat was shot from under the tank */
+const TEAM_MESSAGE_TICKS = 25;           /* copies of one team message to its recipients arrive within this many ticks */
+
+function set_shell_rule(rules, name, value) {
+	if (!Number.isInteger(value)) return;
+	if (name === "shell_speed" && value >= 1 && value <= 255) rules.shell_speed = value;
+	if (name === "shell_start_add" && value >= 0 && value <= 0x7fffffff) rules.shell_start_add = value;
+}
+
+function shell_tracker(scripts) {
+	let rules = { ...CLASSIC_SHELL_RULES };
+	let opening = scripts && scripts.rules;
+	if (opening && typeof opening === "object") {
+		for (let name in rules) set_shell_rule(rules, name, opening[name]);
+	}
+	/* each tank's armour as its last TankSetStock had it (WinBolo 2.1) */
+	let armour = Array(MAX_TANKS).fill(null);
+	return { tracks: [], ended: [], bursts: new Map(), rules, armour };
+}
+
+function burst_key(e) {
+	return (e.mx << 16) | (e.px << 12) | (e.my << 4) | e.py;
+}
+
+/* Process one tick once it is complete: the shells, then the sounds of
+ * whatever else changed (only during the build pass, when sounds is
+ * given). */
+function track_tick(tr, tick, tick_events, state, effects, fall_segments, sounds) {
+	/* for the sounds: the squares traced shells hit this tick, and the
+	 * squares something untraced burst on (wreckage, a mine, a boat run over) */
+	let hits = sounds ? { squares: new Set(), blasted: new Set() } : null;
+	track_shells(tr, tick, tick_events, state, effects, fall_segments, sounds, hits);
+	if (sounds) terrain_sounds(tick, tick_events, sounds, hits);
+}
+
+/* Process one tick's Shell events once the tick is complete: extend the
+ * tracks, start new ones at muzzles, and explain the bursts. Marks the
+ * events themselves (owner, age, cause) so the state and the renderer
+ * see the verdicts. Falls add a splash effect and a fall segment; a birth
+ * at a muzzle and an explained burst each add a sound. */
+function track_shells(tr, tick, tick_events, state, effects, fall_segments, sounds, hits) {
+	let flights = [], bursts = [], fired_by = [];
+	let hurt = new Set(); /* the tanks whose armour fell this tick */
+	for (let e of tick_events) {
+		if (e.type === EV.RuleSet && e.rule_name) set_shell_rule(tr.rules, e.rule_name, e.value);
+		if (e.type === EV.TankSetStock && e.player < MAX_TANKS) {
+			if (tr.armour[e.player] !== null && e.armour < tr.armour[e.player]) hurt.add(e.player);
+			tr.armour[e.player] = e.armour;
+		}
+		if (e.type !== EV.Shell) continue;
+		if (e.dir !== undefined) {
+			flights.push(e);
+			/* the rules as they stood when this shell was logged, for a
+			 * shell new this tick */
+			fired_by.push({ step: tr.rules.shell_speed / 256, start_add: tr.rules.shell_start_add });
+		}
+		else bursts.push(e);
+	}
+	if (!flights.length && !bursts.length && !tr.tracks.length) return;
+
+	/* extend tracks: each to the nearest shell at its predicted position */
+	let pairs = [];
+	for (let i = 0; i < tr.tracks.length; i++) {
+		let t = tr.tracks[i];
+		let travel = t.step * (tick - t.last_tick);
+		let px = t.x + DIR_VECTORS[t.dir][0] * travel, py = t.y + DIR_VECTORS[t.dir][1] * travel;
+		/* a fast shell strays further from its rounded heading in a tick */
+		let tolerance = Math.max(TRACK_TOLERANCE, travel * DIRECTION_ERROR + 1 / 16);
+		for (let j = 0; j < flights.length; j++) {
+			let f = flights[j];
+			if (f.dir !== t.dir) continue;
+			let d = Math.hypot(world_x(f) - px, world_y(f) - py);
+			if (d <= tolerance) pairs.push([d, i, j]);
+		}
+	}
+	pairs.sort((a, b) => a[0] - b[0]);
+	let track_used = new Set(), flight_used = new Set();
+	let next = [];
+	for (let [, i, j] of pairs) {
+		if (track_used.has(i) || flight_used.has(j)) continue;
+		track_used.add(i); flight_used.add(j);
+		let t = tr.tracks[i], f = flights[j];
+		t.x = world_x(f); t.y = world_y(f); t.age++; t.last_tick = tick;
+		f.owner = t.owner; f.pill_owner = t.pill_owner; f.age = t.age;
+		next.push(t);
+	}
+	for (let i = 0; i < tr.tracks.length; i++) {
+		if (!track_used.has(i)) tr.ended.push(tr.tracks[i]);
+	}
+	/* new shells: born at the muzzle of a tank or a pillbox, which lies
+	 * behind the shell along its heading; the nearest such wins */
+	for (let j = 0; j < flights.length; j++) {
+		if (flight_used.has(j)) continue;
+		let f = flights[j];
+		let { step, start_add } = fired_by[j];
+		let x = world_x(f), y = world_y(f);
+		let [hx, hy] = DIR_VECTORS[f.dir];
+		/* Under other rules the shell is first seen its start offset (and at
+		 * most a step more) out along its heading, so a muzzle is judged by
+		 * how far it sits from there, and off the line; a tank beside a fast
+		 * shell is not the one that fired it. Classic rules keep the plain
+		 * nearest muzzle. */
+		let classic = step === SHELL_STEP && start_add === CLASSIC_SHELL_RULES.shell_start_add;
+		let offset = step * start_add;
+		let owner = null, best = classic ? MUZZLE_TOLERANCE : 0.25 + start_add * Math.SQRT2 / 256, muzzle = null;
+		/* for a pillbox's shell, whose the pillbox was when it fired */
+		let pill_owner;
+		let consider = (mx, my, who, pill_who) => {
+			let dx = x - mx, dy = y - my;
+			let d = Math.hypot(dx, dy);
+			if (!classic) {
+				let across = Math.abs(dx * hy - dy * hx);
+				let back = Math.max(offset, Math.min(offset + step, d));
+				d = Math.hypot(d - back, Math.max(0, across - d * DIRECTION_ERROR)) + across * 0.01;
+			}
+			if (d <= best && dx * hx + dy * hy >= -0.25) { best = d; owner = who; pill_owner = pill_who; muzzle = { x: mx, y: my }; }
+		};
+		for (let p of state.players) {
+			/* a tank that died this tick keeps its last position (see
+			 * PlayerLocation) and may have fired on its way out: the
+			 * shell is logged in the death tick, after the death */
+			if (p.tank.in_world || p.tank.died_at === tick) consider(world_x(p.tank), world_y(p.tank), p.slot);
+		}
+		for (let p of state.pills) {
+			if (p.on_map && !p.in_tank && p.armour > 0) consider(p.x + 0.5, p.y + 0.5, PILL_OWNER, p.owner);
+		}
+		f.owner = owner; f.pill_owner = pill_owner; f.age = 0;
+		next.push({ x, y, dir: f.dir, step, age: 0, owner, pill_owner, born: tick, last_tick: tick });
+		/* one gunshot per shell traced to a muzzle, at the muzzle; a shell
+		 * first seen away from every muzzle is a track lost and found again,
+		 * not a second shot */
+		if (sounds && owner !== null) {
+			WinBoloSound.push_sound(sounds, { tick, kind: "shooting", player: owner === PILL_OWNER ? null : owner, x: muzzle.x, y: muzzle.y });
+		}
+	}
+	tr.tracks = next;
+	tr.ended = tr.ended.filter(t => tick - t.last_tick <= TRACK_GRACE_TICKS);
+
+	for (let e of bursts) {
+		let key = burst_key(e);
+		let known = tr.bursts.get(key);
+		if (known && tick - known.tick <= BURST_FRAME_TICKS) {
+			e.cause = known.cause; e.owner = known.owner;
+			continue;
+		}
+		/* The stages step down every third tick on a clock shared by all
+		 * explosions, so a fresh burst is first logged at stage 8 or, when
+		 * the step falls on its first tick, already at 7. Anything lower
+		 * with no known burst began before this tick's view of it. */
+		if (e.explosion < 7) continue;
+		/* a fresh burst: the track that ends here, if any: the one whose
+		 * heading passes closest, with the burst ahead of its last position */
+		let bx = world_x(e) + 0.5, by = world_y(e) + 0.5; /* the burst tile's centre; see renderer */
+		let best = null, best_score = Infinity;
+		for (let t of tr.ended) {
+			let [hx, hy] = DIR_VECTORS[t.dir];
+			let dx = bx - t.x, dy = by - t.y;
+			let along = dx * hx + dy * hy;
+			let across = Math.abs(dx * hy - dy * hx);
+			/* a faster shell may burst further on */
+			let gap = tick - t.last_tick;
+			let extra = Math.max(0, (t.step - SHELL_STEP) * gap);
+			if (along < -BURST_BEHIND || along > BURST_AHEAD + extra || across > BURST_ACROSS + extra * DIRECTION_ERROR) continue;
+			/* the expected point is a step per tick since the last position */
+			let expected = t.step * gap;
+			let score = across + Math.abs(along - expected) * 0.5;
+			if (score < best_score) { best_score = score; best = t; }
+		}
+		if (!best) {
+			/* a mine going off, tank wreckage flying or landing, a boat run
+			 * over: whichever, the square it is over is being blasted */
+			if (hits) hits.blasted.add(Math.floor(by) * MAP_SIZE + Math.floor(bx));
+			continue;
+		}
+		tr.ended = tr.ended.filter(t => t !== best);
+		let { cause, victim } = burst_cause(e, state, bx, by, best.owner, hurt);
+		e.cause = cause; e.owner = best.owner; e.age = best.age;
+		if (victim !== undefined) {
+			/* remembered on the tank, for a drowning that follows */
+			let t = state.players[victim].tank;
+			t.hit_at = tick;
+			t.hit_by = best.owner;
+		}
+		tr.bursts.set(key, { tick, cause, owner: best.owner });
+		if (sounds) {
+			let sx = Math.floor(bx), sy = Math.floor(by);
+			let hit_terrain = state.grid[sy * MAP_SIZE + sx];
+			if (cause === "terrain") {
+				/* what was hit is what the square was before the hit changed it */
+				let change = tick_events.find(m => m.type === EV.MapChange && m.x === sx && m.y === sy && m.from !== undefined);
+				if (change) hit_terrain = change.from;
+				hits.squares.add(sy * MAP_SIZE + sx);
+			}
+			let kind = WinBoloSound.burst_sound(cause, hit_terrain);
+			if (kind) WinBoloSound.push_sound(sounds, { tick, kind, player: victim === undefined ? null : victim, x: bx, y: by });
+		}
+		if (cause === "fall") {
+			if (effects) effects.push({ tick, type: "splash", x: bx, y: by });
+			if (fall_segments) fall_segments.push({ start: best.last_tick, end: tick, from_x: best.x, from_y: best.y, to_x: bx, to_y: by, dir: best.dir, owner: best.owner, pill_owner: best.pill_owner });
+		}
+	}
+	if (tr.bursts.size > 64) {
+		for (let [key, b] of tr.bursts) if (tick - b.tick > BURST_FRAME_TICKS) tr.bursts.delete(key);
+	}
+}
+
+/* The sounds of the tick's terrain changes that no traced shell made:
+ * building, farming, mines laid and going off, wreckage landing. */
+function terrain_sounds(tick, tick_events, sounds, hits) {
+	let craters = [];
+	for (let e of tick_events) {
+		if (e.type !== EV.MapChange || e.from === undefined) continue;
+		let square = e.y * MAP_SIZE + e.x;
+		if (hits.squares.has(square)) continue;
+		let kind = WinBoloSound.terrain_sound(e.from, e.terrain, hits.blasted.has(square));
+		if (kind === "crater") craters.push({ x: e.x, y: e.y });
+		else if (kind) WinBoloSound.push_sound(sounds, { tick, kind, player: null, x: e.x + 0.5, y: e.y + 0.5 });
+	}
+	for (let sound of WinBoloSound.wreckage_sounds(tick, craters)) WinBoloSound.push_sound(sounds, sound);
+}
+
+/* What a burst hit. A collision with a square's contents (a pillbox,
+ * alive or dead; a building or tree; the shore, for a shell fired from a
+ * boat) snaps the burst to that square's centre, so the burst's corner
+ * pixel is the square's origin: that is the sign of a square hit, and
+ * the square's pillbox, if any, is what was hit. A burst elsewhere is
+ * the shell's own position: a tank hit if a tank is within reach (never
+ * the shooter's own), else the shell falling at the end of its range.
+ *
+ * But the server tests a player's shell against the tanks as the
+ * shooter's screen showed them, up to 14 ticks ago (lag compensation, and
+ * pillbox shells against the target's delay before late 2026), so a hit
+ * can burst where the tank was rather than where it is. WinBolo 2.1 logs
+ * every hit's armour loss (TankSetStock) in the burst's tick, so a tank
+ * near the burst that lost armour or died this tick is the one hit. In
+ * 26 replays from 2.1, against their attribution tracks, this finds 868
+ * of the 888 hits (8 % of all) that were falls, and makes 13 falls hits
+ * wrongly. Older logs have no stocks, and the tank's past positions alone
+ * would call too many falls hits, so for them a hit far from its tank
+ * stays a fall unless it killed. */
+function burst_cause(burst, state, bx, by, owner, hurt) {
+	if (burst.px === 0 && burst.py === 0) {
+		let sx = Math.floor(bx), sy = Math.floor(by);
+		return { cause: state.pills.some(p => p.on_map && !p.in_tank && p.x === sx && p.y === sy) ? "pill" : "terrain" };
+	}
+	for (let p of state.players) {
+		let t = p.tank;
+		if (p.slot === owner) continue;
+		let dying = t.died_at === state.tick;
+		if (!t.in_world && !dying) continue;
+		/* a tank's logged position can lag its true one by a pixel or two
+		 * (it is logged only when it changes); a tank dying this very tick
+		 * is allowed the slack */
+		let reach = dying ? TANK_HIT_BOX * 2 : TANK_HIT_BOX;
+		if (Math.abs(world_x(t) - bx) < reach && Math.abs(world_y(t) - by) < reach) return { cause: "tank", victim: p.slot };
+	}
+	let victim, nearest = LAG_HIT_RANGE;
+	for (let p of state.players) {
+		let t = p.tank;
+		let dying = t.died_at === state.tick;
+		if (p.slot === owner || !(hurt.has(p.slot) || dying) || !(t.in_world || dying)) continue;
+		let d = Math.hypot(world_x(t) - bx, world_y(t) - by);
+		if (d < nearest) { nearest = d; victim = p.slot; }
+	}
+	if (victim !== undefined) return { cause: "tank", victim };
+	return { cause: "fall" };
+}
+
+/* The fall segments overlapping a tick: a landing shell drawn on from its
+ * last logged position to its splash. */
+function fall_positions_at(game, tick) {
+	let segments = game.fall_segments;
+	let lo = 0, hi = segments.length;
+	while (lo < hi) {
+		let mid = (lo + hi) >> 1;
+		if (segments[mid].start < tick - TRACK_GRACE_TICKS) lo = mid + 1;
+		else hi = mid;
+	}
+	let out = [];
+	for (let i = lo; i < segments.length && segments[i].start <= tick; i++) {
+		let s = segments[i];
+		if (tick >= s.end) continue;
+		let amount = (tick - s.start) / (s.end - s.start);
+		out.push({ x: s.from_x + (s.to_x - s.from_x) * amount, y: s.from_y + (s.to_y - s.from_y) * amount, dir: s.dir, owner: s.owner, pill_owner: s.pill_owner });
+	}
+	return out;
+}
+/* Shells and men are restated every tick they exist; a state older than
+ * this at the playback clock no longer shows them. */
+const RESTATEMENT_TICKS = 1;
+
+function fresh_player(slot) {
+	return {
+		slot, in_use: false, name: null, location: "", allies: [], quit: false,
+		tank: { mx: 0, my: 0, px: 0, py: 0, dir: 0, on_boat: false, in_world: false, last_seen: -1 },
+		lgm: { mx: 0, my: 0, px: 0, py: 0, frame: 0, out: false, last_seen: -1 },
+	};
+}
+
+function initial_state(grid = null) {
+	if (!grid) {
+		grid = new Uint8Array(MAP_SIZE * MAP_SIZE);
+		grid.fill(DEEP_SEA);
+	}
+	return {
+		tick: -1, grid, grid_version: 0, pills: [], bases: [], starts: [],
+		players: Array.from({ length: MAX_TANKS }, (_, i) => fresh_player(i)),
+		shells: [], start_delay: 0, game_length: 0, mine_blasts: [],
+	};
+}
+
+/* The world as a snapshot records it. Names survive from the previous
+ * state where the snapshot has none (a slot not in use keeps its label in
+ * the sidebar until reused), so the previous state is passed along. The
+ * snapshot's terrain may be passed already decoded, in a grid the new
+ * state then owns. */
+function state_from_snapshot(s, previous, grid = null) {
+	let st = initial_state(grid || WinBoloLog.snapshot_grid(s));
+	st.tick = s.tick - 1;
+	st.grid_version = s.tick;
+	/* every item a snapshot lists is on the map until an EntityMasks after
+	 * it says otherwise (WinBolo 2.1, whose scenarios add and remove them) */
+	st.pills = s.pills.map(p => ({ x: p.x, y: p.y, armour: p.armour, owner: p.owner, in_tank: p.in_tank, speed: p.speed, on_map: true }));
+	st.bases = s.bases.map(b => ({ x: b.x, y: b.y, owner: b.owner, armour: b.armour, shells: b.shells, mines: b.mines, on_map: true }));
+	st.starts = s.starts.map(x => ({ x: x.x, y: x.y, dir: x.dir, on_map: true }));
+	st.start_delay = s.start_delay;
+	st.game_length = s.game_length;
+	for (let i = 0; i < MAX_TANKS; i++) {
+		let p = s.players[i];
+		let pl = st.players[i];
+		let prev = previous ? previous.players[i] : null;
+		/* a seat held before its tank is built (WinBolo 2.1) is in use
+		 * with nothing else to say: no tank yet, so no player to show */
+		if (!p || !p.in_use || !p.tank) {
+			if (prev) { pl.name = prev.name; pl.location = prev.location; pl.quit = prev.quit; }
+			continue;
+		}
+		pl.in_use = true;
+		pl.name = p.name;
+		pl.location = p.location;
+		pl.allies = p.allies.slice();
+		let t = p.tank;
+		pl.tank = { mx: t.mx, my: t.my, px: t.px, py: t.py, dir: t.frame & 15, on_boat: t.on_boat,
+			in_world: t.mx !== 0 || t.my !== 0, last_seen: s.tick };
+		/* the man is only drawn while restated, so he starts hidden and
+		 * the next LgmLocation shows him */
+		pl.lgm = { mx: p.lgm.mx, my: p.lgm.my, px: p.lgm.px, py: p.lgm.py, frame: p.lgm.frame, out: false, last_seen: -1 };
+	}
+	return st;
+}
+
+/* The parts of each player slot that outlive the player: what the sidebar
+ * shows for a slot after its player has left. */
+function player_labels(s) {
+	return s.players.map(p => ({ name: p.name, location: p.location, quit: p.quit }));
+}
+
+function clone_state(s) {
+	return {
+		tick: s.tick, grid: s.grid.slice(), grid_version: s.grid_version,
+		pills: s.pills.map(p => ({ ...p })), bases: s.bases.map(b => ({ ...b })), starts: s.starts.map(x => ({ ...x })),
+		players: s.players.map(p => ({ ...p, allies: p.allies.slice(), tank: { ...p.tank }, lgm: { ...p.lgm } })),
+		shells: s.shells.slice(), start_delay: s.start_delay, game_length: s.game_length, mine_blasts: s.mine_blasts.slice(),
+	};
+}
+
+function name_of(s, p) {
+	let pl = s.players[p];
+	return (pl && pl.name) || `player ${p}`;
+}
+
+/* Alliance team id for colouring: lowest slot in the player's group. */
+function team_of(s, p) {
+	let pl = s.players[p];
+	if (!pl) return p;
+	let t = p;
+	for (let a of pl.allies) if (a < t) t = a;
+	return t;
+}
+
+function ally(s, a, b) {
+	if (a === b || a >= MAX_TANKS || b >= MAX_TANKS) return;
+	/* A joins B's group: everyone in either group allies with everyone in
+	 * the other, so the lists stay symmetric and complete. */
+	let group_a = [a, ...s.players[a].allies];
+	let group_b = [b, ...s.players[b].allies];
+	for (let x of group_a) {
+		for (let y of group_b) {
+			if (x === y) continue;
+			if (!s.players[x].allies.includes(y)) s.players[x].allies.push(y);
+			if (!s.players[y].allies.includes(x)) s.players[y].allies.push(x);
+		}
+	}
+}
+
+function unally(s, p) {
+	if (p >= MAX_TANKS) return;
+	for (let q of s.players[p].allies) {
+		s.players[q].allies = s.players[q].allies.filter(x => x !== p);
+	}
+	s.players[p].allies = [];
+}
+
+/* Did a mine just go off under (or next to) this tank, within `within` ticks? */
+function mine_under(s, t, tick, within = MINE_KILL_TICKS) {
+	return s.mine_blasts.some(b => tick - b.tick <= within && Math.abs(b.x + 0.5 - world_x(t)) <= 1.5 && Math.abs(b.y + 0.5 - world_y(t)) <= 1.5);
+}
+
+/* World position (tile units, tile centres at .5) of a tank, man or shell
+ * from its square and pixel-within-square: WinBolo positions are the
+ * object's centre. */
+function world_x(o) { return o.mx + o.px / 16; }
+function world_y(o) { return o.my + o.py / 16; }
+
+/* Apply one event. effects, chat and sounds, when given, collect the
+ * transient visuals, the message wire and the sounds (only during the
+ * build pass; the sounds of the shells and the terrain are track_tick's). */
+function apply_event(s, e, effects, chat, sounds) {
+	if (e.tick !== s.tick) {
+		/* a new tick: last tick's restated objects are gone until restated */
+		s.tick = e.tick;
+		s.shells = [];
+		for (let pl of s.players) pl.lgm.out = false;
+	}
+	let pl = e.player < MAX_TANKS ? s.players[e.player] : null;
+	let push_chat = (kind, extra) => {
+		if (chat) chat.push({ tick: e.tick, kind, player: e.player, name: name_of(s, e.player), team: team_of(s, e.player), ...extra });
+	};
+	switch (e.type) {
+		case EV.PlayerJoined:
+			if (!pl) break;
+			s.players[e.player] = fresh_player(e.player);
+			pl = s.players[e.player];
+			pl.in_use = true;
+			pl.name = e.player_name;
+			pl.location = e.country || "";
+			push_chat("join", { text: e.player_name, country: e.country });
+			break;
+		case EV.PlayerQuit:
+			if (!pl) break;
+			pl.in_use = false;
+			pl.quit = true;
+			pl.tank.in_world = false;
+			pl.lgm.out = false;
+			unally(s, e.player);
+			push_chat("quit");
+			break;
+		case EV.PlayerRejoin:
+			if (pl) pl.quit = false;
+			push_chat("rejoin");
+			break;
+		case EV.PlayerLeaving:
+			break;
+		case EV.PlayerLocation:
+			if (!pl) break;
+			if (e.in_world) {
+				let was = pl.tank;
+				pl.tank = { mx: e.mx, my: e.my, px: e.px, py: e.py, dir: e.dir, on_boat: e.on_boat, in_world: true, last_seen: e.tick,
+					hit_at: was.hit_at, hit_by: was.hit_by, boat_lost_at: was.boat_lost_at };
+				if (was.in_world && was.on_boat && !e.on_boat) pl.tank.boat_lost_at = e.tick;
+			} else {
+				/* a dead tank is logged at 0,0 at the end of its death tick;
+				 * keep where it died, for the burst that killed it. A tank
+				 * that vanishes with no death logged died to a mine (the
+				 * server logs no KillPlayer or PlayerDied for one) or to
+				 * something else it does not log, such as deep water. */
+				if (pl.tank.in_world && pl.tank.died_at !== e.tick && !pl.quit) {
+					pl.tank.died_at = e.tick;
+					let mined = mine_under(s, pl.tank, e.tick);
+					/* the mine's blast has its own sound; a tank lost in deep water sank */
+					let sank = !mined && !pl.tank.on_boat && s.grid[pl.tank.my * MAP_SIZE + pl.tank.mx] === DEEP_SEA;
+					if (effects) effects.push({ tick: e.tick, type: "tank_death", x: world_x(pl.tank), y: world_y(pl.tank), sinking: sank });
+					push_chat(mined ? "mine_kill" : "died");
+					if (sounds && sank) {
+						WinBoloSound.push_sound(sounds, { tick: e.tick, kind: "tank_sinking", player: null, x: world_x(pl.tank), y: world_y(pl.tank) });
+					}
+				}
+				pl.tank.in_world = false;
+				pl.tank.last_seen = e.tick;
+			}
+			break;
+		case EV.LgmLocation:
+			if (!pl) break;
+			pl.lgm = { mx: e.mx, my: e.my, px: e.px, py: e.py, frame: e.frame, out: true, last_seen: e.tick };
+			break;
+		case EV.MapChange:
+			/* the sounds want what the square was; noted on the event, as the
+			 * tracker notes its verdicts, for the end of the tick */
+			if (sounds) e.from = s.grid[e.y * MAP_SIZE + e.x];
+			if (e.terrain === CRATER && s.grid[e.y * MAP_SIZE + e.x] >= MINE_START) {
+				/* a mine went off: remembered briefly, to tell a mine kill from a pillbox's */
+				s.mine_blasts.push({ tick: e.tick, x: e.x, y: e.y });
+				if (s.mine_blasts.length > 16) s.mine_blasts.shift();
+			}
+			s.grid[e.y * MAP_SIZE + e.x] = e.terrain;
+			s.grid_version++;
+			break;
+		case EV.Shell:
+			s.shells.push(e);
+			break;
+		/* The Sound events (from WinBolo 2.1, which logs gunfire, farming,
+		 * building, mines and deaths) are not drawn: each says again what the
+		 * viewer already draws from the rest of the log. Nor are they heard;
+		 * the sounds are worked out from the same events, which cover old
+		 * logs too. */
+		case EV.MessageServer:
+			if (chat) chat.push({ tick: e.tick, kind: "server", text: e.text });
+			break;
+		case EV.MessageAll:
+			push_chat("say", { text: e.text });
+			break;
+		case EV.MessagePlayers: {
+			/* A team message is logged once per recipient (the sender included),
+			 * a few ticks apart. Fold the copies into one line; the viewer just
+			 * marks it as not sent to all, the recipients are kept for interest. */
+			let last = chat && chat[chat.length - 1];
+			if (last && last.kind === "say" && last.to && last.player === e.player && last.text === e.text && e.tick - last.tick <= TEAM_MESSAGE_TICKS) {
+				if (!last.to.includes(e.to)) last.to.push(e.to);
+				break;
+			}
+			push_chat("say", { text: e.text, to: [e.to] });
+			break;
+		}
+		case EV.ChangeName: {
+			if (!pl) break;
+			let from = pl.name;
+			pl.name = e.player_name;
+			push_chat("rename", { from, text: e.player_name });
+			break;
+		}
+		case EV.AllyRequest:
+			push_chat("ally_request", { other: e.other, other_name: name_of(s, e.other) });
+			break;
+		case EV.AllyAccept:
+			ally(s, e.player, e.other);
+			push_chat("ally_accept", { other: e.other, other_name: name_of(s, e.other) });
+			break;
+		case EV.AllyLeave:
+			unally(s, e.player);
+			push_chat("ally_leave");
+			break;
+		case EV.BaseSetOwner: {
+			let b = s.bases[e.base];
+			if (!b) break;
+			/* Stealing an owned base empties it without a separate stock
+			 * event. Neutral captures and migrations retain their stock. */
+			if (!e.migrate && e.owner !== NEUTRAL && b.owner !== NEUTRAL && b.owner !== e.owner) {
+				b.shells = 0; b.mines = 0; b.armour = 0;
+			}
+			b.owner = e.owner;
+			break;
+		}
+		case EV.BaseSetStock:
+			if (s.bases[e.base]) Object.assign(s.bases[e.base], { shells: e.shells, mines: e.mines, armour: e.armour });
+			break;
+		case EV.PillSetOwner:
+			if (s.pills[e.pill]) s.pills[e.pill].owner = e.owner;
+			break;
+		case EV.PillSetHealth: {
+			let p = s.pills[e.pill];
+			if (!p) break;
+			/* armour going up is the builder's repair: a hit only takes it down */
+			if (sounds && !p.in_tank && e.armour > p.armour) {
+				WinBoloSound.push_sound(sounds, { tick: e.tick, kind: "man_building", player: null, x: p.x + 0.5, y: p.y + 0.5 });
+			}
+			p.armour = e.armour;
+			break;
+		}
+		case EV.PillSetPlace: {
+			let p = s.pills[e.pill];
+			if (!p) break;
+			p.x = e.x; p.y = e.y;
+			/* a pill moves only when a builder puts it down; a dying tank's
+			 * pills land dead, at armour 0, and silently */
+			if (sounds && p.armour > 0) {
+				WinBoloSound.push_sound(sounds, { tick: e.tick, kind: "man_building", player: null, x: e.x + 0.5, y: e.y + 0.5 });
+			}
+			break;
+		}
+		case EV.PillSetInTank:
+			if (s.pills[e.pill]) s.pills[e.pill].in_tank = e.in_tank;
+			break;
+		case EV.EntityChange: {
+			/* a scenario put a pillbox, base or start on the map or took one
+			 * off; a removed item keeps its number, and its record */
+			let list = e.kind === WinBoloLog.ENTITY_PILL ? s.pills : e.kind === WinBoloLog.ENTITY_BASE ? s.bases : e.kind === WinBoloLog.ENTITY_START ? s.starts : null;
+			if (!list || !e.record) break;
+			/* an add past the end leaves any numbers it skips off the map */
+			while (list.length < e.index) list.push({ ...e.record, on_map: false });
+			list[e.index] = { ...e.record, on_map: e.on_map };
+			if (e.kind === WinBoloLog.ENTITY_BASE) s.grid_version++; /* a base square draws as road */
+			break;
+		}
+		case EV.EntityMasks:
+			/* written after a snapshot: which of its items are on the map */
+			s.pills.forEach((p, i) => { p.on_map = (e.pills >> i & 1) !== 0; });
+			s.bases.forEach((b, i) => { b.on_map = (e.bases >> i & 1) !== 0; });
+			s.starts.forEach((x, i) => { x.on_map = (e.starts >> i & 1) !== 0; });
+			s.grid_version++;
+			break;
+		case EV.ServerText:
+			/* a line a scenario sent: to everyone, a team or one player */
+			if (chat) chat.push({ tick: e.tick, kind: "server", text: e.text });
+			break;
+		case EV.SaveMap:
+			push_chat("save_map");
+			break;
+		case EV.PlayerReady:
+			push_chat("ready");
+			break;
+		case EV.PlayerUnready:
+			push_chat("unready");
+			break;
+		case EV.CountdownStart:
+			if (chat) chat.push({ tick: e.tick, kind: "countdown" });
+			break;
+		case EV.CountdownCancel:
+			if (chat) chat.push({ tick: e.tick, kind: "countdown_cancel" });
+			break;
+		case EV.LobbyExit:
+			if (chat) chat.push({ tick: e.tick, kind: "game_start" });
+			break;
+		case EV.GameVoteStart:
+			push_chat("vote_called", { what: WinBoloLog.VOTE_KINDS[e.kind] || `vote kind ${e.kind}` });
+			break;
+		case EV.GameVoteCast:
+			push_chat("vote_cast", { vote: e.vote });
+			break;
+		case EV.GameVoteEnd:
+			if (chat) chat.push({ tick: e.tick, kind: "vote_result", what: WinBoloLog.VOTE_KINDS[e.kind] || `vote kind ${e.kind}`, passed: e.passed });
+			break;
+		case EV.SpectatorJoined:
+			if (chat) chat.push({ tick: e.tick, kind: "spectator_join", text: e.player_name, country: e.country });
+			break;
+		case EV.SpectatorLeft:
+			if (chat) chat.push({ tick: e.tick, kind: "spectator_quit", text: e.player_name });
+			break;
+		case EV.SpectatorChat:
+			/* spectators have no slot; the server has never written one of these */
+			if (chat) chat.push({ tick: e.tick, kind: "say", name: `spectator ${e.spectator}`, spectator: true, text: e.text });
+			break;
+		case EV.LostMan:
+			if (!pl) break;
+			/* the man's last position is logged the tick before he dies (the
+			 * death is logged early in the tick, positions at its end) */
+			if (e.tick - pl.lgm.last_seen <= 2) {
+				if (effects) effects.push({ tick: e.tick, type: "lgm_death", x: world_x(pl.lgm), y: world_y(pl.lgm), player: e.player });
+				if (sounds) WinBoloSound.push_sound(sounds, { tick: e.tick, kind: "man_dying", player: null, x: world_x(pl.lgm), y: world_y(pl.lgm) });
+			}
+			pl.lgm.out = false;
+			push_chat("lost_man");
+			break;
+		case EV.KillPlayer:
+		case EV.PlayerDied:
+			if (!pl) break;
+			/* version 2 logs a death as KillPlayer and PlayerDied together
+			 * (the public source wrote one or the other); the second of
+			 * the pair in one tick adds nothing */
+			if (pl.tank.died_at === e.tick) break;
+			let burst = null;
+			if (effects && pl.tank.in_world) {
+				burst = { tick: e.tick, type: "tank_death", x: world_x(pl.tank), y: world_y(pl.tank), sinking: false };
+				effects.push(burst);
+			}
+			pl.tank.in_world = false;
+			pl.tank.died_at = e.tick;
+			pl.lgm.out = false;
+			if (e.type === EV.KillPlayer && e.killer === e.player && mine_under(s, pl.tank, e.tick, 0)) {
+				/* a tank killed by its own mine is logged as killed by itself,
+				 * as a drowning is; the mine's crater comes earlier in the same
+				 * tick (an older blast nearby says nothing: drownings follow them) */
+				push_chat("mine_kill");
+			} else if (e.type === EV.KillPlayer && e.killer === e.player) {
+				/* a tank in deep water is logged as killed by itself: it drove
+				 * in, or its boat was shot from under it (a hit on the tank
+				 * and the boat flag dropping, a tick or two before) */
+				let t = pl.tank;
+				if (burst) burst.sinking = true;
+				if (sounds) WinBoloSound.push_sound(sounds, { tick: e.tick, kind: "tank_sinking", player: null, x: world_x(t), y: world_y(t) });
+				if (t.boat_lost_at !== undefined && e.tick - t.boat_lost_at <= SINK_TICKS && t.hit_at !== undefined && e.tick - t.hit_at <= SINK_TICKS) {
+					/* the shooter is null when the tracker could not place the
+					 * shell's muzzle; the line then names nobody */
+					let sinker = t.hit_by === undefined ? null : t.hit_by;
+					push_chat("boat_sunk", { sinker, sinker_name: sinker === PILL_OWNER ? "a pillbox" : sinker === null ? null : name_of(s, sinker) });
+				} else {
+					push_chat("drowned");
+				}
+			} else if (e.type === EV.KillPlayer && e.killer === NEUTRAL) {
+				/* the public source logs a pillbox kill as PlayerDied; version 2
+				 * logs KillPlayer with the killer NEUTRAL, for a pillbox or a
+				 * mine alike: a mine that just went off under the tank tells
+				 * them apart (unverified: no mine death seen yet) */
+				push_chat(mine_under(s, pl.tank, e.tick) ? "mine_kill" : "pill_kill");
+			} else if (e.type === EV.KillPlayer) {
+				push_chat("kill", { killer: e.killer, killer_name: name_of(s, e.killer) });
+			} else {
+				push_chat("died");
+			}
+			break;
+		default:
+			break; /* types the public source does not know: see FORMAT.md */
+	}
+}
+
+/* ---------- building a game ---------- */
+
+function same_bytes(a, b) {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+/* Generator: yields progress in [0, 1], returns the game. One pass over
+ * the events collects the message wire, the effects and the final state;
+ * seeking then works from the snapshots. */
+function* build_steps(log, scripts = null) {
+	let chat = [];
+	let effects = [];
+	let sounds = [];
+	let fall_segments = [];
+	let tracker = shell_tracker(scripts);
+	let tick_events = [];
+	let current_tick = -1;
+	let snaps = log.snapshots;
+	/* the labels (name, country, quit) of every slot as of each snapshot,
+	 * carried through the snapshots that lack them; a seek back to a
+	 * snapshot restores them, since a snapshot alone has no name for a
+	 * slot whose player has left */
+	let snapshot_labels = [];
+	let state = initial_state();
+	let next_snap = 0;
+	/* the last terrain decoded, and the runs it came from: a server writes
+	 * the same map snapshot after snapshot, so the decoding is reused while
+	 * the runs are unchanged, and copied into the one working grid, which
+	 * nothing else holds (a server left running for days writes hundreds of
+	 * thousands of snapshots, too many to give each a grid of its own) */
+	let last_runs = null, last_grid = null;
+	let adopt = () => {
+		let s = snaps[next_snap];
+		if (!last_runs || !same_bytes(s.runs, last_runs)) {
+			last_runs = s.runs;
+			last_grid = WinBoloLog.snapshot_grid(s);
+		}
+		state.grid.set(last_grid);
+		state = state_from_snapshot(s, state, state.grid);
+		snapshot_labels.push(player_labels(state));
+		next_snap++;
+	};
+	if (snaps.length && snaps[0].tick === 0) adopt();
+	let events = log.events;
+	let step = Math.max(1, events.length >> 7);
+	for (let i = 0; i < events.length; i++) {
+		let e = events[i];
+		/* a snapshot between events resets nothing the events would not,
+		 * but it is the truth: adopt it, keeping the names it lacks */
+		while (next_snap < snaps.length && snaps[next_snap].event_index <= i) adopt();
+		if (e.tick !== current_tick) {
+			if (current_tick >= 0) track_tick(tracker, current_tick, tick_events, state, effects, fall_segments, sounds);
+			tick_events = [];
+			current_tick = e.tick;
+		}
+		apply_event(state, e, effects, chat, sounds);
+		tick_events.push(e);
+		if (i % step === 0) yield i / events.length;
+	}
+	if (current_tick >= 0) track_tick(tracker, current_tick, tick_events, state, effects, fall_segments, sounds);
+	sounds.sort((a, b) => a.tick - b.tick);
+	while (next_snap < snaps.length) adopt();
+	let start = game_start_tick(log);
+	let marker = lobby_exit_tick(log);
+	if (marker < 0) marker = start;
+	let game = {
+		log, scripts, header: log.header, events, snapshots: snaps, snapshot_labels,
+		/* the lobby before the game is not part of the replay: the clock,
+		 * the seek bar and the effects all begin at the start. The wire
+		 * keeps the lobby's lines, at negative times, so the chat before
+		 * the game is not lost; the "game started" line divides them from
+		 * the game's. The server's marker is a tick or two before the
+		 * replay's start, and what it logs in that tick (the marker, the
+		 * lobby's alliances) is the game's beginning, so those lines are
+		 * moved up to the start, 0:00, rather than reading -0:01 */
+		chat: chat.map(m => m.tick >= marker && m.tick < start ? { ...m, tick: start } : m),
+		fall_segments: fall_segments.filter(s => s.start >= start),
+		/* the server's announcements from the whole log, lobby included:
+		 * the map changes happen there */
+		server_messages: chat.filter(m => m.kind === "server"),
+		effects: effects.filter(e => e.tick >= start),
+		/* {tick, kind, player, x, y}: the sounds of the game, in tick order;
+		 * player names the tank that fired or was hit, for the self sounds */
+		sounds: sounds.filter(s => s.tick >= start),
+		t0: start, t1: log.ticks, final: state,
+		bounds: land_bounds(state.grid),
+	};
+	return game;
+}
+
+function build(log, scripts = null) {
+	let steps = build_steps(log, scripts);
+	let step = steps.next();
+	while (!step.done) step = steps.next();
+	return step.value;
+}
+
+/* Bounding box of the land in a grid, or null for an all-sea map. */
+function land_bounds(grid) {
+	let minx = MAP_SIZE, miny = MAP_SIZE, maxx = -1, maxy = -1;
+	for (let y = 0; y < MAP_SIZE; y++) {
+		for (let x = 0; x < MAP_SIZE; x++) {
+			if (grid[y * MAP_SIZE + x] !== DEEP_SEA) {
+				if (x < minx) minx = x;
+				if (x > maxx) maxx = x;
+				if (y < miny) miny = y;
+				if (y > maxy) maxy = y;
+			}
+		}
+	}
+	return maxx < 0 ? null : { minx, miny, maxx, maxy };
+}
+
+/* The tick of the server's game-start marker, or -1 without one. */
+function lobby_exit_tick(log) {
+	for (let e of log.events) {
+		if (e.type === EV.LobbyExit) return e.tick;
+	}
+	return -1;
+}
+
+/* The tick the game begins. A server log begins when the server starts,
+ * often long before anyone plays; the server marks the start with a
+ * GameStart event, writes the populated world one tick later and the
+ * first tank position the tick after that. The replay opens on the first
+ * of those that shows a world. A log without the marker (cut off, or
+ * from a server that does not write it) starts where a tank first
+ * appears, and one with no tanks at all at its beginning. */
+function game_start_tick(log) {
+	let marker = lobby_exit_tick(log);
+	/* the populated snapshot the server writes a tick after the marker;
+	 * a later one is a periodic snapshot, not the start */
+	for (let s of log.snapshots) {
+		if (s.tick >= marker && s.tick <= marker + 2 && s.players.some(p => p.in_use && p.tank)) return s.tick;
+	}
+	for (let e of log.events) {
+		if (e.type === EV.PlayerLocation && e.in_world && e.tick >= marker) return e.tick;
+	}
+	return Math.max(0, marker);
+}
+
+/* ---------- seeking ---------- */
+
+/* Index of the last snapshot at or before tick (-1 if none). */
+function snapshot_before(snaps, tick) {
+	let lo = 0, hi = snaps.length;
+	while (lo < hi) {
+		let mid = (lo + hi) >> 1;
+		if (snaps[mid].tick <= tick) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo - 1;
+}
+
+/* First event index with an event tick >= tick. */
+function event_lower_bound(events, tick) {
+	let lo = 0, hi = events.length;
+	while (lo < hi) {
+		let mid = (lo + hi) >> 1;
+		if (events[mid].tick < tick) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo;
+}
+
+/* State at a tick: the nearest snapshot at or before it, replayed forward
+ * through every event up to and including that tick. Returns the state
+ * and the index of the first event not yet applied. The labels of slots
+ * the snapshot marks unused (a player who has left keeps a greyed name in
+ * the sidebar) are the ones the build pass carried to that snapshot, so
+ * the state matches what playing forward through the quit would show. */
+function state_at(game, tick) {
+	tick = Math.floor(tick);
+	let snaps = game.snapshots;
+	let si = snapshot_before(snaps, tick);
+	let state, index;
+	if (si < 0) {
+		state = initial_state();
+		index = 0;
+	} else {
+		let labels = game.snapshot_labels && game.snapshot_labels[si];
+		state = state_from_snapshot(snaps[si], labels ? { players: labels } : null);
+		index = snaps[si].event_index;
+	}
+	let events = game.events;
+	while (index < events.length && events[index].tick <= tick) {
+		apply_event(state, events[index], null, null);
+		index++;
+	}
+	return { state, index };
+}
+
+/* Apply events forward from `index` through tick; returns the new index. */
+function advance(game, state, index, tick) {
+	let events = game.events;
+	while (index < events.length && events[index].tick <= tick) {
+		apply_event(state, events[index], null, null);
+		index++;
+	}
+	return index;
+}
+
+/* The tick of the next (direction 1) or previous (-1) event block, within
+ * the replay's span. */
+function adjacent_change_tick(game, tick, direction) {
+	let events = game.events;
+	if (direction > 0) {
+		let i = event_lower_bound(events, Math.floor(tick) + 1);
+		return i < events.length ? Math.max(game.t0, events[i].tick) : game.t1;
+	}
+	let i = event_lower_bound(events, Math.ceil(tick)) - 1;
+	return i >= 0 ? Math.max(game.t0, events[i].tick) : game.t0;
+}
+
+/* Objects the state restates every tick are only current while the
+ * playback clock sits on the state's tick. */
+function restated(state, clock) {
+	return clock - state.tick <= RESTATEMENT_TICKS;
+}
+
+/* The rules a game was played under, where they are not the classic ones:
+ * [{name, value, changes: [{tick, value}]}], by name, so a rule's
+ * family (shell_, speed_, tank_...) reads together. scripts.json gives the rules its scripts' manifests set; what
+ * on_setup and the rest of the round start wrote is RuleSet events at or
+ * before the start, and those go over it as the opening value. A RuleSet
+ * after the start is a change. value is undefined for a rule that opened
+ * on its classic value and was changed later. A rule index the parser has
+ * no name for is named by its number, and goes after the named ones. */
+function rule_table(game) {
+	let rows = new Map();
+	let row = name => {
+		if (!rows.has(name)) rows.set(name, { name, value: undefined, changes: [] });
+		return rows.get(name);
+	};
+	let opening = game.scripts && game.scripts.rules;
+	if (opening && typeof opening === "object") {
+		for (let name in opening) {
+			if (Number.isFinite(opening[name])) row(name).value = opening[name];
+		}
+	}
+	for (let e of game.events) {
+		if (e.type !== EV.RuleSet) continue;
+		let r = row(e.rule_name || `rule ${e.rule}`);
+		if (e.tick <= game.t0) r.value = e.value;
+		else r.changes.push({ tick: e.tick, value: e.value });
+	}
+	let unnamed = r => r.name.startsWith("rule ") ? 1 : 0;
+	return [...rows.values()].sort((a, b) => unnamed(a) - unnamed(b) ||
+		(unnamed(a) ? parseInt(a.name.slice(5)) - parseInt(b.name.slice(5)) : a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/* The round's game type. The header has the type the server was set to
+ * when the log began, often in the lobby, where it may be changed before
+ * the round starts; a GameSettings event at or before the start has the
+ * type the round was played under. A blob too short to hold the type
+ * reads it as 0, which is no type. */
+function game_type(game) {
+	let type = game.header.game_type;
+	for (let e of game.events) {
+		if (e.tick > game.t0) break;
+		if (e.type === EV.GameSettings && e.game_type) type = e.game_type;
+	}
+	return type;
+}
+
+const LAG_SETTLE_TICKS = 2 * TICKS_PER_SECOND; /* every client reads a long round trip as the round starts; not counted as lag */
+const LAG_HOLD_TICKS = TICKS_PER_SECOND;       /* a PlayerLag stands for a second at most: the server writes one a second */
+const LAG_SPIKE_MS = 200;                      /* a round trip this far over the player's typical one is a spike */
+const LAG_SPIKE_GAP_TICKS = TICKS_PER_SECOND;  /* spikes within this of each other, any player's, are one */
+
+/* The round trip a player had for half the time its records cover: each
+ * record stands until the next, for a second at most. */
+function typical_rtt(records) {
+	let spans = records.map((r, i) => ({
+		ms: r.rtt_ms,
+		ticks: Math.min(LAG_HOLD_TICKS, i + 1 < records.length ? records[i + 1].tick - r.tick : LAG_HOLD_TICKS),
+	})).sort((a, b) => a.ms - b.ms);
+	let total = spans.reduce((n, s) => n + s.ticks, 0);
+	let seen = 0;
+	for (let s of spans) {
+		seen += s.ticks;
+		if (seen * 2 >= total) return s.ms;
+	}
+	return 0;
+}
+
+/* The lag of the game, from the PlayerLag and OverrunStats events a 2.2
+ * server writes, or null for a log with neither:
+ *
+ *   server   the server's frame timing as its last OverrunStats has it
+ *            (the counts run from the round's start), or null:
+ *            { frames, over_budget, budget_ms, peak_ms, peak_from, peak_to,
+ *            bots }. The worst frame fell between the ticks peak_from and
+ *            peak_to, the 30 s between the record that first held it and
+ *            the one before. bots is null for a round without any, else
+ *            { target_ms, overruns, thinks, peak_ms }.
+ *   players  [{ player, typical_ms, worst_ms }] by slot, for each player
+ *            whose round trip was ever above 0 (a bot's never is).
+ *            worst_ms is null for one with no record after the start.
+ *   spikes   [{ tick, players, peak_ms }] in order: the times a round trip
+ *            went LAG_SPIKE_MS over its player's typical one, with the
+ *            slots it happened to together. All of them at once is the
+ *            server stalling; one alone is that player's connection.
+ *
+ * The first two seconds of the game are left out of worst_ms and spikes. */
+function lag_summary(game) {
+	let records = new Map(); /* slot -> its PlayerLag events */
+	let stats = [];
+	for (let e of game.events) {
+		if (e.tick < game.t0) continue;
+		if (e.type === EV.PlayerLag && e.player !== undefined) {
+			if (!records.has(e.player)) records.set(e.player, []);
+			records.get(e.player).push(e);
+		} else if (e.type === EV.OverrunStats && e.round_frames !== undefined) {
+			/* the frame count starting again is another round's: not this game's */
+			if (stats.length && e.round_frames < stats[stats.length - 1].round_frames) break;
+			stats.push(e);
+		}
+	}
+
+	let server = null;
+	if (stats.length) {
+		let last = stats[stats.length - 1];
+		let peak = -1, peak_from = 0, peak_to = 0, before = 0;
+		for (let s of stats) {
+			if (s.tick_peak_ms > peak) {
+				peak = s.tick_peak_ms;
+				peak_from = before;
+				peak_to = s.round_frames;
+			}
+			before = s.round_frames;
+		}
+		server = {
+			/* a frame is a log tick, and the round's first is the game's start */
+			frames: last.round_frames, over_budget: last.over_budget, budget_ms: last.budget_ms,
+			peak_ms: last.tick_peak_ms, peak_from: game.t0 + peak_from, peak_to: game.t0 + peak_to,
+			bots: last.has_bots ? { target_ms: last.target_ms, overruns: last.total_overruns, thinks: last.total_thinks, peak_ms: last.brain_peak_ms } : null,
+		};
+	}
+
+	let players = [];
+	let high = []; /* every record over its player's spike line */
+	let settled = game.t0 + LAG_SETTLE_TICKS;
+	for (let [player, list] of [...records].sort((a, b) => a[0] - b[0])) {
+		if (!list.some(r => r.rtt_ms > 0)) continue;
+		let typical_ms = typical_rtt(list);
+		let worst_ms = null;
+		for (let r of list) {
+			if (r.tick < settled) continue;
+			if (worst_ms === null || r.rtt_ms > worst_ms) worst_ms = r.rtt_ms;
+			if (r.rtt_ms >= typical_ms + LAG_SPIKE_MS) high.push(r);
+		}
+		players.push({ player, typical_ms, worst_ms });
+	}
+	high.sort((a, b) => a.tick - b.tick);
+	let spikes = [];
+	let last_tick = -Infinity;
+	for (let r of high) {
+		if (r.tick - last_tick > LAG_SPIKE_GAP_TICKS) spikes.push({ tick: r.tick, players: [], peak_ms: 0 });
+		let spike = spikes[spikes.length - 1];
+		if (!spike.players.includes(r.player)) spike.players.push(r.player);
+		spike.peak_ms = Math.max(spike.peak_ms, r.rtt_ms);
+		last_tick = r.tick;
+	}
+	for (let s of spikes) s.players.sort((a, b) => a - b);
+
+	return server || players.length ? { server, players, spikes } : null;
+}
+
+const WinBoloGame = {
+	EFFECT_TICKS, NEUTRAL, TICKS_PER_SECOND, lag_summary,
+	initial_state, state_from_snapshot, clone_state, apply_event, build, build_steps,
+	state_at, advance, adjacent_change_tick, restated, team_of, name_of, world_x, world_y,
+	land_bounds, event_lower_bound, game_start_tick, fall_positions_at, PILL_OWNER, rule_table, game_type,
+};
+
+if (typeof module !== "undefined" && module.exports) {
+	module.exports = WinBoloGame;
+} else {
+	window.WinBoloGame = WinBoloGame;
+}
+
+})();
