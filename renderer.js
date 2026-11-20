@@ -1862,6 +1862,21 @@ function open_log() {
 	file_pick.click();
 }
 
+/* Under Electron, the replay named on the command line: main.js reads it
+ * and preload.js hands it over as wbv_host, which a browser doesn't have.
+ * Claimed before the read, as in take_file, so a replay dropped meanwhile
+ * wins. */
+function take_host_file() {
+	if (!window.wbv_host) return;
+	let claim = ++load_claims;
+	let fail = message => { if (claim === load_claims) show_error("Could not read file", message); };
+	window.wbv_host.initial_file(MAX_LOG_BYTES).then(f => {
+		if (!f) return;
+		if (f.error) fail(f.error);
+		else load_log(f.bytes, f.name, claim);
+	}, err => fail(String(err)));
+}
+
 /* ---------- canvas sizing ---------- */
 
 /* The view is stored by its top-left corner, so a resize would otherwise
@@ -1920,3 +1935,4 @@ BoloSprites.load(request_draw);
 load_obj_sprites();
 resize();
 zoom_label.textContent = `zoom ${view.zoom}×`;
+take_host_file();

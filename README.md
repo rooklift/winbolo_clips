@@ -19,8 +19,10 @@ from disk or from any static file server. Or, as an
 [Electron](https://www.electronjs.org/) window around the same page:
 
 ```
-npx electron .
+npx electron . [replay]
 ```
+
+A replay named there is opened at once.
 
 The export needs WebCodecs with a VP9 encoder, which Chromium has. Other
 browsers will play replays but may refuse to export.
@@ -119,6 +121,7 @@ node tools/sync.js [path to winbolo_parser]
 | `webm.js`     | a minimal WebM muxer, the Ancient Bolo Log Viewer's      |
 | `mixer.js`    | the soundtrack: the game's sounds mixed offline          |
 | `main.js`     | the Electron window                                      |
+| `preload.js`  | the window's one call to `main.js`, for a replay named on the command line |
 
 ## Tests
 
